@@ -26,7 +26,7 @@ Connects to any Matrix homeserver, handles encrypted rooms via Megolm/Olm, and l
 Add to your `rebar.config`:
 
 ```erlang
-{matrix_bot_light, "2.1.0"}
+{matrix_bot_light, "0.1.2"}
 ```
 
 Required dependencies (pulled automatically):
