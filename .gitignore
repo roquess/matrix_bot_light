@@ -1,5 +1,5 @@
 e2e*
-matrix*
+matrix*bin*
 # ---> Erlang
 .rebar3
 _build
