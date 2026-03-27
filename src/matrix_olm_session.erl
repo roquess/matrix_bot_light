@@ -213,9 +213,9 @@ create_inbound(Account, SenderIdentityKeyB64, PreKeyMsgBin) ->
           one_time_key := OtkKeyB64,
           message      := InnerMsg} = parse_prekey_message(PreKeyMsgBin),
 
-        SenderIdentityKey = b64_decode(SenderIdentityKeyB64),
-        BaseKey           = b64_decode(BaseKeyB64),
-        OtkPub            = b64_decode(OtkKeyB64),
+        SenderIdentityKey = maybe_decode(SenderIdentityKeyB64),
+        BaseKey           = maybe_decode(BaseKeyB64),
+        OtkPub            = maybe_decode(OtkKeyB64),
 
         #account{identity_keypair = {_IdPub, IdPriv},
                  one_time_keys    = OTKs} = Account,
@@ -244,6 +244,9 @@ create_inbound(Account, SenderIdentityKeyB64, PreKeyMsgBin) ->
     catch C:R:St ->
         {error, {inbound_session_failed, C, R, St}}
     end.
+
+maybe_decode(B) when byte_size(B) =:= 32 -> B;
+maybe_decode(B) -> b64_decode(B).
 
 %%%===================================================================
 %%% Message Decryption
@@ -330,7 +333,7 @@ parse_ratchet_message(Bin) ->
     Fields = decode_protobuf(Rest),
     #{ratchet_key => maps:get(1, Fields),
       index       => varint_to_integer(maps:get(2, Fields, <<0>>)),
-      message     => maps:get(3, Fields)}.
+      message     => maps:get(4, Fields)}.
 
 varint_to_integer(B) when is_binary(B)  -> element(1, decode_varint(B));
 varint_to_integer(N) when is_integer(N) -> N.

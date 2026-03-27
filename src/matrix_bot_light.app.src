@@ -1,6 +1,6 @@
 {application, matrix_bot_light,
  [{description, "A simple library for creating Matrix bot"},
-  {vsn, "0.1.2"},
+  {vsn, "0.1.3"},
   {registered, []},
   {mod, {matrix_bot_light_app, []}},
   {applications,
