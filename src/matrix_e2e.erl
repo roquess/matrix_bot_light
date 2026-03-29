@@ -209,8 +209,6 @@ do_encrypt_room_event(RoomId, EventContent, State) ->
             State3   = State2#state{megolm_outbound = Outbound},
             IdKeys   = matrix_olm_session:account_identity_keys(State#state.account),
             SenderKey = maps:get(<<"curve25519">>, IdKeys),
-            io:format("[e2e-diag] megolm_ct_bytes=~p session_id=~s sender_key_len=~p~n",
-                      [byte_size(Ciphertext), SessionId, byte_size(SenderKey)]),
             EncContent = #{
                 <<"algorithm">>  => <<"m.megolm.v1.aes-sha2">>,
                 <<"ciphertext">> => b64u(Ciphertext),
@@ -276,9 +274,6 @@ share_megolm_key(RoomId, OutSession, State) ->
             ClaimReq  = build_claim_request(DeviceMap),
             OtkMap    = claim_one_time_keys(ClaimReq, Token, HS),
 
-            io:format("[e2e-diag] session_key_bytes=~p session_key_b64len=~p session_id=~s~n",
-                      [byte_size(SessionKey), byte_size(b64u(SessionKey)), SessionId]),
-
             RoomKeyContent = #{
                 <<"algorithm">>   => <<"m.megolm.v1.aes-sha2">>,
                 <<"room_id">>     => RoomId,
@@ -307,14 +302,9 @@ share_megolm_key(RoomId, OutSession, State) ->
                                         <<"recipient_keys">> => #{<<"ed25519">> => TheirEd}
                                     },
                                     Plaintext = iolist_to_binary(json:encode(Inner)),
-                                    io:format("[e2e-diag] olm target=~s/~s their_curve_len=~p ptlen=~p~n",
-                                              [TargetUserId, DevId, byte_size(TheirCurve), byte_size(Plaintext)]),
-                                    io:format("[e2e-diag] inner_json=~s~n", [Plaintext]),
                                     case matrix_olm_session:create_olm_prekey_message(
                                             Acc, TheirCurve, OtkB64, Plaintext) of
                                         {ok, PrekeyMsg} ->
-                                            io:format("[e2e-diag] prekey_msg_bytes=~p body_b64len=~p~n",
-                                                      [byte_size(PrekeyMsg), byte_size(base64:encode(PrekeyMsg))]),
                                             EncEvent = #{
                                                 <<"algorithm">> =>
                                                     <<"m.olm.v1.curve25519-aes-sha2">>,
@@ -966,10 +956,6 @@ handle_olm_to_device(Sender, Content, State) ->
     end.
 
 decrypt_olm_message(0, CT, OlmSessKey, SenderKey, State) ->
-    %% Diagnostic: log pre-key message size and first bytes to understand libolm wire format
-    Prefix = binary:part(CT, 0, min(20, byte_size(CT))),
-    io:format("[olm-diag-in] prekey_bytes=~p first_bytes=~s~n",
-              [byte_size(CT), [io_lib:format("~2.16.0B", [B]) || <<B>> <= Prefix]]),
     case matrix_olm_session:create_inbound(State#state.account, SenderKey, CT) of
         {ok, Plain, Session, Acc2} ->
             Pkl    = matrix_olm_session:pickle_session(Session),

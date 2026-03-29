@@ -1,13 +1,21 @@
 %%%===================================================================
-%%% matrix_olm_session.erl — Pure Erlang Olm inbound session
+%%% matrix_olm_session.erl — Olm account and session management
 %%%
-%%% Added: create_olm_prekey_message/4  — build an Olm type-0 pre-key
-%%%        message that encrypts a plaintext for a remote device.
-%%%        Used to share Megolm room keys.
+%%% Implements the Olm double-ratchet protocol (https://gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/olm.md):
+%%%   - Account management: identity keys, one-time keys (OTKs)
+%%%   - Outbound: create pre-key messages (type 0) to initiate a session
+%%%   - Inbound:  create sessions from incoming pre-key messages (type 0)
+%%%   - Decrypt ratchet messages (type 1) on established sessions
+%%%
+%%% Note: key fields inside protobuf are unpadded standard base64,
+%%% matching libolm wire format.
 %%%===================================================================
 -module(matrix_olm_session).
 
 -export([
+    %% Self-test
+    test_olm_roundtrip/0,
+    %% Account management
     create_account/0,
     account_identity_keys/1,
     account_ed25519_keypair/1,
@@ -15,14 +23,15 @@
     account_generate_otks/2,
     account_mark_otks_published/1,
     account_remove_otk/2,
+    %% Session — outbound (pre-key) and inbound
+    create_olm_prekey_message/4,
     create_inbound/3,
     decrypt/3,
+    %% Serialization
     pickle_account/1,
     unpickle_account/1,
     pickle_session/1,
-    unpickle_session/1,
-    %% NEW
-    create_olm_prekey_message/4
+    unpickle_session/1
 ]).
 
 -type curve25519_keypair() :: {binary(), binary()}.
@@ -65,8 +74,8 @@ create_account() ->
 -spec account_identity_keys(#account{}) -> #{binary() => binary()}.
 account_identity_keys(#account{identity_keypair = {Pub, _},
                                 ed25519_keypair  = {EdPub, _}}) ->
-    #{<<"curve25519">> => base64url(Pub),
-      <<"ed25519">>    => base64url(EdPub)}.
+    #{<<"curve25519">> => b64u(Pub),
+      <<"ed25519">>    => b64u(EdPub)}.
 
 -spec account_ed25519_keypair(#account{}) -> {binary(), binary()}.
 account_ed25519_keypair(#account{ed25519_keypair = KP}) -> KP.
@@ -76,7 +85,7 @@ account_one_time_keys(#account{one_time_keys = OTKs, published_otk_ids = Publish
     maps:fold(fun(KeyId, {Pub, _}, Acc) ->
         case lists:member(KeyId, Published) of
             true  -> Acc;
-            false -> maps:put(<<"curve25519:", KeyId/binary>>, base64url(Pub), Acc)
+            false -> maps:put(<<"curve25519:", KeyId/binary>>, b64u(Pub), Acc)
         end
     end, #{}, OTKs).
 
@@ -95,26 +104,25 @@ account_mark_otks_published(Acc = #account{one_time_keys = OTKs,
 -spec account_remove_otk(#account{}, binary()) -> #account{}.
 account_remove_otk(Acc = #account{one_time_keys = OTKs}, OtkPubB64) ->
     Acc#account{one_time_keys = maps:filter(
-        fun(_, {Pub, _}) -> base64url(Pub) =/= OtkPubB64 end, OTKs)}.
+        fun(_, {Pub, _}) -> b64u(Pub) =/= OtkPubB64 end, OTKs)}.
 
 %%%===================================================================
-%%% Outbound: create an Olm pre-key message (NEW)
+%%% Outbound: Olm pre-key message (type 0)
 %%%
-%%% Olm pre-key message wire format (version 3):
-%%%   0x03                   — version byte
-%%%   protobuf:
-%%%     field 1 (bytes) = one_time_key  pub B64   (their OTK)
-%%%     field 2 (bytes) = base_key      pub B64   (our ephemeral)
-%%%     field 3 (bytes) = identity_key  pub B64   (our identity)
-%%%     field 4 (bytes) = message       ciphertext+mac
+%%% Outer wire format (version 3):
+%%%   0x03 | protobuf (no MAC on outer pre-key messages)
+%%%     field 1 (tag 0x0A, bytes) = one_time_key  — recipient OTK raw Curve25519 pub (32 bytes)
+%%%     field 2 (tag 0x12, bytes) = base_key      — sender ephemeral pub (32 bytes)
+%%%     field 3 (tag 0x1A, bytes) = identity_key  — sender identity pub (32 bytes)
+%%%     field 4 (tag 0x22, bytes) = inner ratchet message (raw bytes)
 %%%
-%%% The inner "message" is itself a ratchet message (version byte 0x03):
-%%%   0x03
-%%%   protobuf:
-%%%     field 1 (bytes) = ratchet_key  (= base_key pub B64, first message)
-%%%     field 2 (varint)= index        (0 for first message)
-%%%     field 3 (bytes) = ciphertext   (AES-CBC encrypted, pkcs7-padded)
-%%%   + 8-byte HMAC-SHA256 MAC (truncated)
+%%% Inner ratchet message wire format:
+%%%   0x03 | protobuf | MAC(8 bytes)
+%%%     field 1 (bytes)  = ratchet_key  — raw Curve25519 key (= base_key on first msg)
+%%%     field 2 (varint) = index        — 0 for the first message
+%%%     field 4 (bytes)  = ciphertext   — AES-256-CBC, PKCS7-padded
+%%%
+%%% Key fields are raw bytes in protobuf — libolm wire convention.
 %%%===================================================================
 -spec create_olm_prekey_message(#account{}, binary(), binary(), binary()) ->
         {ok, binary()} | {error, term()}.
@@ -144,19 +152,18 @@ create_olm_prekey_message(Account, TheirCurveB64, TheirOtkB64, Plaintext) ->
         %% Fresh ephemeral base key
         {BasePub, BasePriv} = generate_curve25519_keypair(),
 
-        %% X3DH outbound (Alice), matching libolm / Element:
-        %%   master_secret = ECDH(I_A, I_B) || ECDH(E_A, I_B) || ECDH(E_A, OT_B)
-        %%   S1 = ECDH(identity_priv,  their_identity_pub)   [I_A, I_B]
-        %%   S2 = ECDH(base_priv,      their_identity_pub)   [E_A, I_B]
-        %%   S3 = ECDH(base_priv,      their_otk_pub)        [E_A, OT_B]
-        S1 = ecdh(IdPriv,   TheirIdKey),
+        %% X3DH outbound (Alice), matching vodozemac / libolm:
+        %%   S1 = ECDH(I_A, OT_B) = ecdh(identity_priv, their_otk_pub)
+        %%   S2 = ECDH(E_A, I_B)  = ecdh(base_priv,     their_identity_pub)
+        %%   S3 = ECDH(E_A, OT_B) = ecdh(base_priv,     their_otk_pub)
+        %%   IKM = S1 || S2 || S3  (96 bytes, no prefix)
+        S1 = ecdh(IdPriv,   TheirOtk),
         S2 = ecdh(BasePriv, TheirIdKey),
         S3 = ecdh(BasePriv, TheirOtk),
 
-        IKM = <<(binary:copy(<<16#FF>>, 32))/binary,
-                S1/binary, S2/binary, S3/binary>>,
+        IKM = <<S1/binary, S2/binary, S3/binary>>,
         <<_RootKey:32/binary, ChainKey:32/binary>> =
-            crypto:hkdf(sha256, IKM, <<0:256>>, ?OLM_ROOT_INFO, 64),
+            hkdf(sha256, IKM, <<0:256>>, ?OLM_ROOT_INFO, 64),
 
         MsgKey = hmac256(ChainKey, ?MSG_KEY_SEED),
         {AesKey, MacKey, AesIv} = derive_olm_keys(MsgKey),
@@ -170,7 +177,7 @@ create_olm_prekey_message(Account, TheirCurveB64, TheirOtkB64, Plaintext) ->
         Ct     = crypto:crypto_one_time(aes_256_cbc, AesKey, AesIv, Padded, true),
 
         %% Inner ratchet message (type 1) — libolm lib/message.cpp field IDs:
-        %%   field 1 = ratchet_key (bytes)
+        %%   field 1 = ratchet_key (bytes) — raw 32-byte Curve25519 key
         %%   field 2 = counter     (varint)
         %%   field 4 = ciphertext  (bytes)  ← NOT 3, libolm CIPHERTEXT_ID = 4
         %% Wire: VERSION(0x03) | PROTOBUF | MAC(8 bytes)
@@ -179,15 +186,14 @@ create_olm_prekey_message(Account, TheirCurveB64, TheirOtkB64, Plaintext) ->
         InnerMac  = binary:part(hmac256(MacKey, InnerHead), 0, 8),
         InnerMsg  = <<InnerHead/binary, InnerMac/binary>>,
 
-        %% Outer pre-key message (type 0) — libolm lib/message.cpp:
-        %%   field 1 = one_time_key  (bytes)
-        %%   field 2 = base_key      (bytes)
-        %%   field 3 = identity_key  (bytes)
-        %%   field 4 = message       (bytes) = the inner message
-        %% Wire: VERSION(0x03) | PROTOBUF   ← NO MAC on outer message!
+        %% Outer pre-key message (type 0) — libolm lib/message.c tag constants:
+        %%   field 1 (tag 0x0A) = one_time_key  — raw 32-byte Curve25519 key
+        %%   field 2 (tag 0x12) = base_key      — raw 32-byte Curve25519 key
+        %%   field 3 (tag 0x1A) = identity_key  — raw 32-byte Curve25519 key
+        %%   field 4 (tag 0x22) = message       — inner ratchet message bytes
+        %% Wire: VERSION(0x03) | PROTOBUF  (no trailing MAC on outer pre-key messages)
         OuterPb  = encode_pb([{1, TheirOtk}, {2, BasePub}, {3, IdPub}, {4, InnerMsg}]),
         OuterMsg = <<3:8, OuterPb/binary>>,
-
         {ok, OuterMsg}
     catch C:R:St ->
         {error, {prekey_failed, C, R, St}}
@@ -213,22 +219,27 @@ create_inbound(Account, SenderIdentityKeyB64, PreKeyMsgBin) ->
           one_time_key := OtkKeyB64,
           message      := InnerMsg} = parse_prekey_message(PreKeyMsgBin),
 
-        SenderIdentityKey = b64_decode(SenderIdentityKeyB64),
-        BaseKey           = b64_decode(BaseKeyB64),
-        OtkPub            = b64_decode(OtkKeyB64),
+        SenderIdentityKey = maybe_decode(SenderIdentityKeyB64),
+        BaseKey           = maybe_decode(BaseKeyB64),
+        OtkPub            = maybe_decode(OtkKeyB64),
 
         #account{identity_keypair = {_IdPub, IdPriv},
                  one_time_keys    = OTKs} = Account,
 
         {_, OtkPrivKey} = find_otk_by_pub(OTKs, OtkPub),
 
-        S1 = ecdh(IdPriv,     BaseKey),
-        S2 = ecdh(OtkPrivKey, SenderIdentityKey),
+        %% Inbound X3DH (Bob's perspective), mirroring outbound:
+        %%   S1 = ECDH(OT_B, I_A)  = ecdh(OtkPrivKey, SenderIdentityKey)
+        %%   S2 = ECDH(I_B,  E_A)  = ecdh(IdPriv,     BaseKey)
+        %%   S3 = ECDH(OT_B, E_A)  = ecdh(OtkPrivKey, BaseKey)
+        %%   IKM = S1 || S2 || S3  (96 bytes, no prefix)
+        S1 = ecdh(OtkPrivKey, SenderIdentityKey),
+        S2 = ecdh(IdPriv,     BaseKey),
         S3 = ecdh(OtkPrivKey, BaseKey),
 
-        IKM = <<(binary:copy(<<16#FF>>, 32))/binary, S1/binary, S2/binary, S3/binary>>,
+        IKM = <<S1/binary, S2/binary, S3/binary>>,
         <<RootKey:32/binary, ChainKey:32/binary>> =
-            crypto:hkdf(sha256, IKM, <<0:256>>, ?OLM_ROOT_INFO, 64),
+            hkdf(sha256, IKM, <<0:256>>, ?OLM_ROOT_INFO, 64),
 
         Session = #olm_session{
             root_key          = RootKey,
@@ -245,6 +256,9 @@ create_inbound(Account, SenderIdentityKeyB64, PreKeyMsgBin) ->
         {error, {inbound_session_failed, C, R, St}}
     end.
 
+maybe_decode(B) when byte_size(B) =:= 32 -> B;
+maybe_decode(B) -> b64_decode(B).
+
 %%%===================================================================
 %%% Message Decryption
 %%%===================================================================
@@ -253,9 +267,9 @@ create_inbound(Account, SenderIdentityKeyB64, PreKeyMsgBin) ->
         {ok, binary(), #olm_session{}} | {error, term()}.
 decrypt(Session, 1, CiphertextBin) ->
     try
-        #{ratchet_key := RatchetKeyB64,
+        #{ratchet_key := RatchetKey,
           message     := Ciphertext} = parse_ratchet_message(CiphertextBin),
-        decrypt_ratchet(Session, Ciphertext, b64_decode(RatchetKeyB64))
+        decrypt_ratchet(Session, Ciphertext, maybe_decode(RatchetKey))
     catch C:R ->
         {error, {decrypt_failed, C, R}}
     end;
@@ -279,8 +293,8 @@ decrypt_ratchet(Session = #olm_session{
             false ->
                 DhSecret = ecdh(MyPriv, TheirRatchetKey),
                 <<NewRootKey:32/binary, NewChainKey:32/binary>> =
-                    crypto:hkdf(sha256, <<RootKey/binary, DhSecret/binary>>,
-                                <<0:256>>, ?OLM_RATCHET_INFO, 64),
+                    hkdf(sha256, <<RootKey/binary, DhSecret/binary>>,
+                         <<0:256>>, ?OLM_RATCHET_INFO, 64),
                 S2 = Session#olm_session{
                     root_key          = NewRootKey,
                     recv_chain        = NewChainKey,
@@ -298,11 +312,13 @@ decrypt_ratchet(Session = #olm_session{
     MacStart = MsgLen - 8,
     <<Body:MacStart/binary, Mac:8/binary>> = Ciphertext,
     ExpMac = binary:part(crypto:mac(hmac, sha256, MacKey, Body), 0, 8),
-
     case ExpMac =:= Mac of
         false -> {error, mac_mismatch};
         true  ->
-            case keylara_aes:decrypt(Body, AesKey, AesIv) of
+            <<_BodyVersion:8, InnerPb/binary>> = Body,
+            Fields = decode_protobuf(InnerPb),
+            RawCt  = maps:get(4, Fields),
+            case keylara_aes:decrypt(RawCt, AesKey, AesIv) of
                 {ok, Plaintext} ->
                     {ok, Plaintext, Session2#olm_session{recv_chain = NewChainKey2}};
                 Err -> Err
@@ -311,26 +327,31 @@ decrypt_ratchet(Session = #olm_session{
 
 derive_olm_keys(MsgKey) ->
     <<AesKey:32/binary, MacKey:32/binary, AesIv:16/binary>> =
-        crypto:hkdf(sha256, MsgKey, <<>>, ?OLM_KEYS_INFO, 80),
+        hkdf(sha256, MsgKey, <<>>, ?OLM_KEYS_INFO, 80),
     {AesKey, MacKey, AesIv}.
 
 %%%===================================================================
 %%% Message Parsing
 %%%===================================================================
 
-parse_prekey_message(Bin) ->
+parse_prekey_message(<<_Version:8, Bin/binary>>) ->
     Fields = decode_protobuf(Bin),
-    #{one_time_key => maps:get(1, Fields),
-      base_key     => maps:get(2, Fields),
-      identity_key => maps:get(3, Fields),
-      message      => maps:get(4, Fields)}.
+    OTK  = maps:get(1, Fields, <<>>),   %% one_time_key  tag 0x0A = field 1
+    BK   = maps:get(2, Fields, <<>>),   %% base_key      tag 0x12 = field 2
+    IK   = maps:get(3, Fields, <<>>),   %% identity_key  tag 0x1A = field 3
+    Msg4 = maps:get(4, Fields, <<>>),   %% message       tag 0x22 = field 4
+    #{one_time_key => OTK,
+      base_key     => BK,
+      identity_key => IK,
+      message      => Msg4}.
 
 parse_ratchet_message(Bin) ->
     <<?MSG_VERSION:8, Rest/binary>> = Bin,
     Fields = decode_protobuf(Rest),
+    %% ratchet_key is raw bytes (libolm wire) or base64 — maybe_decode handles both
     #{ratchet_key => maps:get(1, Fields),
       index       => varint_to_integer(maps:get(2, Fields, <<0>>)),
-      message     => maps:get(3, Fields)}.
+      message     => maps:get(4, Fields)}.
 
 varint_to_integer(B) when is_binary(B)  -> element(1, decode_varint(B));
 varint_to_integer(N) when is_integer(N) -> N.
@@ -360,7 +381,7 @@ decode_varint(<<0:1, B:7, Rest/binary>>, Shift, Acc) ->
     {Acc bor (B bsl Shift), Rest}.
 
 %%%===================================================================
-%%% Protobuf encoder (NEW — used by create_olm_prekey_message)
+%%% Protobuf encoder
 %%%===================================================================
 
 encode_pb(Fields) ->
@@ -380,6 +401,17 @@ encode_varint(N) ->
 %%%===================================================================
 %%% Crypto helpers
 %%%===================================================================
+
+%% HKDF-SHA256 (RFC 5869). crypto:hkdf/5 is not available on all OTP builds.
+hkdf(Hash, IKM, Salt, Info, Len) ->
+    PRK = hmac256(Salt, IKM),
+    hkdf_expand(Hash, PRK, Info, 1, <<>>, <<>>, Len).
+
+hkdf_expand(_Hash, _PRK, _Info, _I, _Prev, OKM, Len) when byte_size(OKM) >= Len ->
+    binary:part(OKM, 0, Len);
+hkdf_expand(Hash, PRK, Info, I, Prev, OKM, Len) ->
+    T = crypto:mac(hmac, Hash, PRK, <<Prev/binary, Info/binary, I:8>>),
+    hkdf_expand(Hash, PRK, Info, I + 1, T, <<OKM/binary, T/binary>>, Len).
 
 ecdh(PrivKey, PubKey) ->
     crypto:compute_key(ecdh, PubKey, PrivKey, x25519).
@@ -419,7 +451,10 @@ find_otk_by_pub(OTKs, OtkPub) ->
         KP        -> KP
     end.
 
-base64url(Bin) -> base64:encode(Bin).
+%% Unpadded standard base64 (libolm wire format for key fields in protobuf).
+b64u(Bin) ->
+    B = base64:encode(Bin),
+    << <<C>> || <<C>> <= B, C =/= $= >>.
 
 b64_decode(B64) ->
     Padded = case byte_size(B64) rem 4 of
@@ -427,6 +462,39 @@ b64_decode(B64) ->
         N -> <<B64/binary, (binary:copy(<<"=">>, 4 - N))/binary>>
     end,
     base64:decode(Padded).
+
+%%%===================================================================
+%%% Self-test: Olm round-trip
+%%%===================================================================
+
+test_olm_roundtrip() ->
+    {ok, Alice} = create_account(),
+    {ok, Bob0}  = create_account(),
+    Bob1 = account_generate_otks(Bob0, 1),
+    Bob2 = account_mark_otks_published(Bob1),
+
+    BobIdKeys = account_identity_keys(Bob2),
+    BobCurve  = maps:get(<<"curve25519">>, BobIdKeys),
+
+    [{OtkPub, _}] = maps:values(Bob2#account.one_time_keys),
+    OtkPubB64 = b64u(OtkPub),
+
+    Plaintext = <<"olm round-trip test">>,
+    {ok, PrekeyMsg} = create_olm_prekey_message(Alice, BobCurve, OtkPubB64, Plaintext),
+    io:format("[olm-rt] prekey_bytes=~p~n", [byte_size(PrekeyMsg)]),
+
+    AliceIdKeys = account_identity_keys(Alice),
+    AliceCurve  = maps:get(<<"curve25519">>, AliceIdKeys),
+
+    case create_inbound(Bob2, AliceCurve, PrekeyMsg) of
+        {ok, Decrypted, _Session, _Bob3} ->
+            Match = Decrypted =:= Plaintext,
+            io:format("[olm-rt] decrypted_ok=true match=~p~n", [Match]),
+            Match;
+        {error, E} ->
+            io:format("[olm-rt] FAILED: ~p~n", [E]),
+            false
+    end.
 
 %%%===================================================================
 %%% Pickle / Unpickle

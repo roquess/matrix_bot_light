@@ -29,7 +29,7 @@
     next_batch      = undefined :: binary() | undefined,
     bot_user_id     = undefined :: binary() | undefined,
     command_handler = undefined :: term(),
-    txn_id          = 0         :: non_neg_integer(),
+    txn_id          = erlang:system_time(millisecond) :: non_neg_integer(),
     registered_cmds = []        :: [binary()],
     %% rooms known to use E2E encryption
     encrypted_rooms = sets:new() :: sets:set()
@@ -559,8 +559,29 @@ do_whoami(State = #state{token = Token, homeserver = Hostname}) ->
 
 do_send_message(RoomId, Content, State) ->
     case sets:is_element(RoomId, State#state.encrypted_rooms) of
-        true  -> do_send_message_encrypted(RoomId, Content, State);
-        false -> do_send_message_plain(RoomId, Content, State)
+        true  ->
+            do_send_message_encrypted(RoomId, Content, State);
+        false ->
+            %% Room not yet seen via sync — check server state to avoid sending plaintext
+            %% into an encrypted room on first send after restart.
+            State2 = maybe_mark_encrypted(RoomId, State),
+            case sets:is_element(RoomId, State2#state.encrypted_rooms) of
+                true  -> do_send_message_encrypted(RoomId, Content, State2);
+                false -> do_send_message_plain(RoomId, Content, State2)
+            end
+    end.
+
+maybe_mark_encrypted(RoomId, State) ->
+    Path = "/_matrix/client/v3/rooms/" ++
+           uri_string:quote(binary_to_list(RoomId)) ++
+           "/state/m.room.encryption",
+    case matrix_http:get(State#state.homeserver, Path, State#state.token) of
+        {ok, _} ->
+            io:format("[matrix] room ~s marked as encrypted (state check)~n", [RoomId]),
+            State#state{encrypted_rooms =
+                sets:add_element(RoomId, State#state.encrypted_rooms)};
+        _ ->
+            State
     end.
 
 %% Plain path — unchanged behaviour
