@@ -1,19 +1,28 @@
 %%%===================================================================
-%%% matrix_megolm.erl — Megolm inbound + outbound sessions
+%%% matrix_megolm.erl — Megolm inbound and outbound session crypto
+%%%
+%%% Implements the Megolm ratchet (https://gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/megolm.md):
+%%%   - Outbound: create session, encrypt messages, export session key for sharing
+%%%   - Inbound:  import session key, decrypt messages
+%%%
+%%% Wire format (version 3):
+%%%   0x03 | field 0x08 (varint: index) | field 0x12 (bytes: ciphertext) | MAC(8) | Sig(64)
 %%%===================================================================
 -module(matrix_megolm).
 
 -export([
-    %% Inbound
+    %% Inbound session
     init_inbound/1, decrypt/2, session_id/1, pickle/1, unpickle/1,
     hmac/2, pkcs7unpad/1, decode_varint/1,
-    %% Outbound (NEW)
+    %% Outbound session
     create_outbound/0,
     outbound_session_key/1,
     outbound_session_id/1,
     encrypt_outbound/2,
     pickle_outbound/1,
-    unpickle_outbound/1
+    unpickle_outbound/1,
+    %% Crypto primitives (exported for testing)
+    hkdf/5
 ]).
 
 %% Inbound session
@@ -39,7 +48,7 @@
 -define(KEY_VERSION, 2).
 
 %%%===================================================================
-%%% OUTBOUND API (NEW)
+%%% Outbound session API
 %%%===================================================================
 
 -spec create_outbound() -> {ok, #mgm_out{}}.
@@ -53,9 +62,19 @@ create_outbound() ->
                    ed25519_pub=EdPub, ed25519_priv=EdPriv}}.
 
 %% Returns the session key binary to share with room members.
+%% Format (libolm wire): version(1) | counter(4) | R0-R3(128) | ed25519_pub(32) | sig(64)
+%% Element verifies the Ed25519 signature before importing the key.
 -spec outbound_session_key(#mgm_out{}) -> binary().
-outbound_session_key(#mgm_out{counter=C, r0=R0, r1=R1, r2=R2, r3=R3, ed25519_pub=EP}) ->
-    <<?KEY_VERSION:8, C:32/big, R0/binary, R1/binary, R2/binary, R3/binary, EP/binary>>.
+outbound_session_key(#mgm_out{counter=C, r0=R0, r1=R1, r2=R2, r3=R3,
+                               ed25519_pub=EP, ed25519_priv=EPriv}) ->
+    Unsigned = <<?KEY_VERSION:8, C:32/big, R0/binary, R1/binary, R2/binary, R3/binary, EP/binary>>,
+    Sig = crypto:sign(eddsa, none, Unsigned, [EPriv, ed25519]),
+    Key = <<Unsigned/binary, Sig/binary>>,
+    SigOk = crypto:verify(eddsa, none, Unsigned, Sig, [EP, ed25519]),
+    Prefix = binary:part(b64u(Key), 0, 8),
+    io:format("[megolm-diag] session_key sig_ok=~p prefix=~s ep_bytes=~p sig_bytes=~p~n",
+              [SigOk, Prefix, byte_size(EP), byte_size(Sig)]),
+    Key.
 
 %% Returns the session ID (unpadded base64 of the Ed25519 pub).
 -spec outbound_session_id(#mgm_out{}) -> binary().
@@ -76,7 +95,27 @@ encrypt_outbound(Session = #mgm_out{counter=Idx, ed25519_priv=EdPriv}, Plaintext
     Msg0 = <<MsgBody/binary, Mac/binary>>,
     Sig  = crypto:sign(eddsa, none, Msg0, [EdPriv, ed25519]),
     Msg  = <<Msg0/binary, Sig/binary>>,
-    {ok, Msg, advance_outbound(Session)}.
+    %% Verify Ed25519 message signature directly (what libolm does)
+    EdPub = Session#mgm_out.ed25519_pub,
+    MsgSigOk = crypto:verify(eddsa, none, Msg0, Sig, [EdPub, ed25519]),
+    io:format("[megolm-rt] msg_sig_ok=~p msg_bytes=~p sig_bytes=~p~n",
+              [MsgSigOk, byte_size(Msg0), byte_size(Sig)]),
+    NextSession = advance_outbound(Session),
+    %% Round-trip self-test
+    SessionKey = outbound_session_key(Session),
+    case init_inbound(SessionKey) of
+        {ok, InboundS} ->
+            case decrypt(InboundS, Msg) of
+                {ok, {Decrypted, _Idx, _}} ->
+                    Match = Decrypted =:= Plaintext,
+                    io:format("[megolm-rt] self_decrypt=ok plaintext_match=~p~n", [Match]);
+                {error, Reason} ->
+                    io:format("[megolm-rt] self_decrypt=FAIL reason=~p~n", [Reason])
+            end;
+        {error, R} ->
+            io:format("[megolm-rt] init_inbound=FAIL reason=~p~n", [R])
+    end,
+    {ok, Msg, NextSession}.
 
 -spec pickle_outbound(#mgm_out{}) -> binary().
 pickle_outbound(S) -> term_to_binary(S).
@@ -88,7 +127,7 @@ unpickle_outbound(Bin) ->
     end.
 
 %%%===================================================================
-%%% INBOUND API (unchanged)
+%%% Inbound session API
 %%%===================================================================
 
 init_inbound(SessionKeyBin) ->
@@ -110,10 +149,24 @@ decrypt(Session, CiphertextBin) ->
             false ->
                 {error, mac_mismatch};
             true ->
-                PlainPadded = crypto:crypto_one_time(aes_256_cbc, AesKey, AesIv, Ct, false),
-                Plaintext   = pkcs7unpad(PlainPadded),
-                Session3    = advance(Session2, MsgIndex + 1),
-                {ok, {Plaintext, MsgIndex, Session3}}
+                %% Verify Ed25519 signature (libolm always verifies this)
+                SigLen    = 64,
+                MsgLen2   = byte_size(CiphertextBin),
+                Msg0Part  = binary:part(CiphertextBin, 0, MsgLen2 - SigLen),
+                SigPart   = binary:part(CiphertextBin, MsgLen2 - SigLen, SigLen),
+                EdPub     = Session2#mgm.ed25519_pub,
+                SigValid  = case EdPub of
+                    undefined -> true;
+                    _         -> crypto:verify(eddsa, none, Msg0Part, SigPart, [EdPub, ed25519])
+                end,
+                case SigValid of
+                    false -> {error, sig_mismatch};
+                    true  ->
+                        PlainPadded = crypto:crypto_one_time(aes_256_cbc, AesKey, AesIv, Ct, false),
+                        Plaintext   = pkcs7unpad(PlainPadded),
+                        Session3    = advance(Session2, MsgIndex + 1),
+                        {ok, {Plaintext, MsgIndex, Session3}}
+                end
         end
     catch C:R:_Stack ->
         {error, {decrypt_failed, C, R}}
@@ -154,7 +207,7 @@ derive_keys(#mgm{r0 = R0, r1 = R1, r2 = R2, r3 = R3}) ->
     {AesKey, MacKey, AesIv}.
 
 %%%===================================================================
-%%% Outbound ratchet (NEW)
+%%% Outbound ratchet
 %%%===================================================================
 
 advance_outbound(S = #mgm_out{counter=Ctr, r0=R0, r1=R1, r2=R2, r3=R3}) ->
