@@ -198,7 +198,7 @@ do_encrypt_room_event(RoomId, EventContent, State) ->
             SenderKey = maps:get(<<"curve25519">>, IdKeys),
             EncContent = #{
                 <<"algorithm">>  => <<"m.megolm.v1.aes-sha2">>,
-                <<"ciphertext">> => base64:encode(Ciphertext),
+                <<"ciphertext">> => b64u(Ciphertext),
                 <<"device_id">>  => State#state.device_id,
                 <<"sender_key">> => SenderKey,
                 <<"session_id">> => SessionId
@@ -298,7 +298,7 @@ share_megolm_key(RoomId, OutSession, State) ->
                                                 <<"ciphertext">> => #{
                                                     TheirCurve => #{
                                                         <<"type">> => 0,
-                                                        <<"body">> => base64:encode(PrekeyMsg)
+                                                        <<"body">> => b64u(PrekeyMsg)
                                                     }
                                                 }
                                             },
