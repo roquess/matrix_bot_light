@@ -1,10 +1,14 @@
 %%%===================================================================
-%%% matrix_e2e.erl — E2E crypto state manager
+%%% matrix_e2e.erl — E2E encryption state manager (gen_server)
 %%%
-%%% Added:
-%%%   encrypt_room_event/2  — encrypt a room event with Megolm
-%%%   megolm_outbound state — outbound sessions per room
-%%%   share_megolm_key      — Olm key sharing with room members
+%%% Responsibilities:
+%%%   - Manage Olm account, OTK upload, cross-signing keys
+%%%   - Decrypt incoming Megolm room events
+%%%   - Encrypt outgoing room events with per-room outbound Megolm sessions
+%%%   - Share Megolm session keys to room members via Olm pre-key messages
+%%%   - Handle m.room_key_request: re-share keys to devices that missed them
+%%%   - SAS device verification (m.sas.v1)
+%%%   - Key backup import (Curve25519-AES-CBC backup format)
 %%%===================================================================
 -module(matrix_e2e).
 -behaviour(gen_server).
@@ -12,8 +16,7 @@
 -export([start_link/2, decrypt_room_event/1, handle_to_device/1, device_keys/0,
          request_room_key/3, upload_device_self_signature/7, b64u/1,
          reupload_device_sig/0, verify_with/2, fetch_backup_keys/1,
-         %% NEW
-         encrypt_room_event/2]).
+         encrypt_room_event/2, reset_outbound_sessions/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -44,8 +47,8 @@
     cross_signing_user     = undefined,
     cross_signing_uploaded = false :: boolean(),
     verifications          = #{} :: #{},
-    %% NEW: outbound Megolm sessions, one per room
-    %%   #{RoomId => {SessionId::binary(), Pickle::binary()}}
+    %% Outbound Megolm sessions, one per room.
+    %% #{RoomId => {SessionId::binary(), Pickle::binary()}}
     megolm_outbound        = #{} :: #{}
 }).
 
@@ -81,12 +84,18 @@ reupload_device_sig() ->
 verify_with(UserId, DeviceId) ->
     gen_server:cast(?MODULE, {verify_with, UserId, DeviceId}).
 
-%% NEW: encrypt a room event with the outbound Megolm session for RoomId.
-%% EventContent is a map like #{<<"type">> => ..., <<"content">> => ..., <<"room_id">> => ...}
-%% Returns {ok, EncryptedContent} where EncryptedContent is the m.room.encrypted payload.
+%% Encrypts a room event using the outbound Megolm session for RoomId.
+%% EventContent must include <<"type">>, <<"content">>, and <<"room_id">>.
+%% Returns {ok, EncryptedContent} — an m.room.encrypted payload ready to PUT.
 -spec encrypt_room_event(binary(), map()) -> {ok, map()} | {error, term()}.
 encrypt_room_event(RoomId, EventContent) ->
     gen_server:call(?MODULE, {encrypt_room_event, RoomId, EventContent}, 30000).
+
+%% Drop all cached outbound Megolm sessions. Next send will create fresh
+%% sessions and re-share keys via Olm to all room members.
+-spec reset_outbound_sessions() -> ok.
+reset_outbound_sessions() ->
+    gen_server:call(?MODULE, reset_outbound_sessions).
 
 %%%===================================================================
 %%% gen_server
@@ -128,10 +137,14 @@ handle_call({fetch_backup_keys, RecoveryKey}, _From, State) ->
 handle_call(device_keys, _From, State) ->
     Keys = matrix_olm_session:account_identity_keys(State#state.account),
     {reply, {ok, Keys#{<<"device_id">> => State#state.device_id}}, State};
-%% NEW
 handle_call({encrypt_room_event, RoomId, EventContent}, _From, State) ->
     {Result, NewState} = do_encrypt_room_event(RoomId, EventContent, State),
     {reply, Result, NewState};
+handle_call(reset_outbound_sessions, _From, State) ->
+    NewState = State#state{megolm_outbound = #{}},
+    save_state(NewState),
+    io:format("E2E: outbound sessions reset~n"),
+    {reply, ok, NewState};
 handle_call(_R, _F, S) ->
     {reply, {error, unknown_request}, S}.
 
@@ -182,7 +195,7 @@ code_change(_OldVsn, S, _E) ->
     {ok, S}.
 
 %%%===================================================================
-%%% NEW: Outbound Megolm encryption
+%%% Outbound Megolm encryption
 %%%===================================================================
 
 do_encrypt_room_event(RoomId, EventContent, State) ->
@@ -196,6 +209,8 @@ do_encrypt_room_event(RoomId, EventContent, State) ->
             State3   = State2#state{megolm_outbound = Outbound},
             IdKeys   = matrix_olm_session:account_identity_keys(State#state.account),
             SenderKey = maps:get(<<"curve25519">>, IdKeys),
+            io:format("[e2e-diag] megolm_ct_bytes=~p session_id=~s sender_key_len=~p~n",
+                      [byte_size(Ciphertext), SessionId, byte_size(SenderKey)]),
             EncContent = #{
                 <<"algorithm">>  => <<"m.megolm.v1.aes-sha2">>,
                 <<"ciphertext">> => b64u(Ciphertext),
@@ -233,7 +248,7 @@ ensure_outbound_session(RoomId, State) ->
     end.
 
 %%%===================================================================
-%%% NEW: Megolm key sharing via Olm pre-key messages
+%%% Outbound Megolm key sharing — broadcast to all room members
 %%%===================================================================
 
 share_megolm_key(RoomId, OutSession, State) ->
@@ -261,10 +276,14 @@ share_megolm_key(RoomId, OutSession, State) ->
             ClaimReq  = build_claim_request(DeviceMap),
             OtkMap    = claim_one_time_keys(ClaimReq, Token, HS),
 
+            io:format("[e2e-diag] session_key_bytes=~p session_key_b64len=~p session_id=~s~n",
+                      [byte_size(SessionKey), byte_size(b64u(SessionKey)), SessionId]),
+
             RoomKeyContent = #{
                 <<"algorithm">>   => <<"m.megolm.v1.aes-sha2">>,
                 <<"room_id">>     => RoomId,
                 <<"session_id">>  => SessionId,
+                %% libolm validates session_key length == b64_output_length(229)=308 (padded)
                 <<"session_key">> => b64u(SessionKey)
             },
 
@@ -288,9 +307,14 @@ share_megolm_key(RoomId, OutSession, State) ->
                                         <<"recipient_keys">> => #{<<"ed25519">> => TheirEd}
                                     },
                                     Plaintext = iolist_to_binary(json:encode(Inner)),
+                                    io:format("[e2e-diag] olm target=~s/~s their_curve_len=~p ptlen=~p~n",
+                                              [TargetUserId, DevId, byte_size(TheirCurve), byte_size(Plaintext)]),
+                                    io:format("[e2e-diag] inner_json=~s~n", [Plaintext]),
                                     case matrix_olm_session:create_olm_prekey_message(
                                             Acc, TheirCurve, OtkB64, Plaintext) of
                                         {ok, PrekeyMsg} ->
+                                            io:format("[e2e-diag] prekey_msg_bytes=~p body_b64len=~p~n",
+                                                      [byte_size(PrekeyMsg), byte_size(base64:encode(PrekeyMsg))]),
                                             EncEvent = #{
                                                 <<"algorithm">> =>
                                                     <<"m.olm.v1.curve25519-aes-sha2">>,
@@ -334,7 +358,115 @@ share_megolm_key(RoomId, OutSession, State) ->
     end.
 
 %%%===================================================================
-%%% NEW: HTTP helpers for key sharing
+%%% Outbound Megolm key sharing — targeted (respond to key requests)
+%%%===================================================================
+
+%% Handles an incoming m.room_key_request to-device event.
+%% If we hold the requested outbound session, we re-share it to the
+%% requesting device only.
+handle_key_request(Sender, Content, State) ->
+    case maps:get(<<"action">>, Content, <<>>) of
+        <<"request">> ->
+            Body     = maps:get(<<"body">>,                 Content, #{}),
+            ReqDevId = maps:get(<<"requesting_device_id">>, Content, <<>>),
+            RoomId   = maps:get(<<"room_id">>,    Body, <<>>),
+            SessId   = maps:get(<<"session_id">>, Body, <<>>),
+            case maps:get(RoomId, State#state.megolm_outbound, undefined) of
+                {SessId, Pickle} ->
+                    io:format("E2E: key request from ~s/~s for session ~s — sharing~n",
+                              [Sender, ReqDevId, SessId]),
+                    {ok, Session} = matrix_megolm:unpickle_outbound(Pickle),
+                    spawn(fun() ->
+                        try share_megolm_key_to_device(RoomId, Session, Sender, ReqDevId, State)
+                        catch C:R:St ->
+                            io:format("E2E: share_megolm_key_to_device crash ~p:~p~n~p~n",
+                                      [C, R, St])
+                        end
+                    end),
+                    State;
+                _ ->
+                    io:format("E2E: key request for unknown session ~s from ~s — ignoring~n",
+                              [SessId, Sender]),
+                    State
+            end;
+        _ ->
+            State
+    end.
+
+%% Shares the outbound Megolm session key to a single target device via Olm.
+share_megolm_key_to_device(RoomId, Session, TargetUserId, TargetDevId, State) ->
+    #state{token=Token, homeserver=HS, user_id=UserId, account=Acc} = State,
+    SessionKey = matrix_megolm:outbound_session_key(Session),
+    SessionId  = matrix_megolm:outbound_session_id(Session),
+    IdKeys     = matrix_olm_session:account_identity_keys(Acc),
+    OurCurve   = maps:get(<<"curve25519">>, IdKeys),
+    OurEd      = maps:get(<<"ed25519">>,    IdKeys),
+    DeviceMap  = query_device_keys([TargetUserId], Token, HS),
+    case maps:get(TargetUserId, DeviceMap, undefined) of
+        undefined ->
+            io:format("[e2e-out] key-req share: no device keys for ~s~n", [TargetUserId]);
+        UserDevs ->
+            case maps:get(TargetDevId, UserDevs, undefined) of
+                undefined ->
+                    io:format("[e2e-out] key-req share: device ~s/~s not found~n",
+                              [TargetUserId, TargetDevId]);
+                {TheirCurve, TheirEd} ->
+                    ClaimReq = #{TargetUserId => #{TargetDevId => <<"signed_curve25519">>}},
+                    OtkMap   = claim_one_time_keys(ClaimReq, Token, HS),
+                    case get_device_otk(OtkMap, TargetUserId, TargetDevId) of
+                        not_found ->
+                            io:format("[e2e-out] key-req share: no OTK for ~s/~s~n",
+                                      [TargetUserId, TargetDevId]);
+                        {ok, OtkB64} ->
+                            RoomKeyContent = #{
+                                <<"algorithm">>   => <<"m.megolm.v1.aes-sha2">>,
+                                <<"room_id">>     => RoomId,
+                                <<"session_id">>  => SessionId,
+                                <<"session_key">> => b64u(SessionKey)
+                            },
+                            Inner = #{
+                                <<"type">>           => <<"m.room_key">>,
+                                <<"content">>        => RoomKeyContent,
+                                <<"sender">>         => UserId,
+                                <<"recipient">>      => TargetUserId,
+                                <<"keys">>           => #{<<"ed25519">> => OurEd},
+                                <<"recipient_keys">> => #{<<"ed25519">> => TheirEd}
+                            },
+                            Plaintext = iolist_to_binary(json:encode(Inner)),
+                            case matrix_olm_session:create_olm_prekey_message(
+                                     Acc, TheirCurve, OtkB64, Plaintext) of
+                                {ok, PrekeyMsg} ->
+                                    EncEvent = #{
+                                        <<"algorithm">>  => <<"m.olm.v1.curve25519-aes-sha2">>,
+                                        <<"sender_key">> => OurCurve,
+                                        <<"ciphertext">> => #{
+                                            TheirCurve => #{
+                                                <<"type">> => 0,
+                                                <<"body">> => b64u(PrekeyMsg)
+                                            }
+                                        }
+                                    },
+                                    TxnId = integer_to_list(erlang:system_time(millisecond)),
+                                    Path  = "/_matrix/client/v3/sendToDevice/m.room.encrypted/"
+                                            ++ TxnId,
+                                    Msgs = #{TargetUserId => #{TargetDevId => EncEvent}},
+                                    case matrix_http:put(HS, Path, Token,
+                                                         #{<<"messages">> => Msgs}) of
+                                        {ok, _} ->
+                                            io:format("[e2e-out] key-req share sent to ~s/~s~n",
+                                                      [TargetUserId, TargetDevId]);
+                                        Err ->
+                                            io:format("[e2e-out] key-req share failed: ~p~n", [Err])
+                                    end;
+                                {error, E} ->
+                                    io:format("[e2e-out] key-req Olm encrypt failed: ~p~n", [E])
+                            end
+                    end
+            end
+    end.
+
+%%%===================================================================
+%%% HTTP helpers for key sharing
 %%%===================================================================
 
 get_room_joined_members(RoomId, Token, HS) ->
@@ -384,7 +516,7 @@ query_device_keys(UserIds, Token, HS) ->
 build_claim_request(DeviceMap) ->
     maps:fold(fun(UserId, UserDevs, Acc) ->
         DevClaims = maps:fold(fun(DevId, _, DA) ->
-            maps:put(DevId, <<"curve25519">>, DA)
+            maps:put(DevId, <<"signed_curve25519">>, DA)
         end, #{}, UserDevs),
         maps:put(UserId, DevClaims, Acc)
     end, #{}, DeviceMap).
@@ -517,7 +649,7 @@ upload_keys(HS, Token, Did, UserId, Acc) ->
             <<"ed25519:",    Did/binary>> => Ed
         }
     },
-    Sig        = sign_json(DeviceKeys0, Acc),
+    Sig        = sign_json_raw(DeviceKeys0, Acc),
     SigKey     = <<"ed25519:", Did/binary>>,
     DeviceKeys = DeviceKeys0#{
         <<"signatures">> => #{UserId => #{SigKey => Sig}}
@@ -695,6 +827,7 @@ process_to_device(Event, State) ->
                     io:format("E2E: unknown to-device algo ~s~n", [Algo]),
                     State
             end;
+        <<"m.room_key_request">>          -> handle_key_request(Sender, Content, State);
         <<"m.key.verification.request">> -> handle_verif_request(Sender, Content, State);
         <<"m.key.verification.start">>   -> handle_verif_start(Sender, Content, State);
         <<"m.key.verification.key">>     -> handle_verif_key(Sender, Content, State);
@@ -827,12 +960,16 @@ handle_olm_to_device(Sender, Content, State) ->
             io:format("E2E: to-device message not addressed to us~n"),
             State;
         #{<<"type">> := MsgType, <<"body">> := Body} ->
-            CT         = to_bin(Body),
+            CT         = b64d(to_bin(Body)),
             OlmSessKey = {SenderKey, Sender},
             decrypt_olm_message(MsgType, CT, OlmSessKey, SenderKey, State)
     end.
 
 decrypt_olm_message(0, CT, OlmSessKey, SenderKey, State) ->
+    %% Diagnostic: log pre-key message size and first bytes to understand libolm wire format
+    Prefix = binary:part(CT, 0, min(20, byte_size(CT))),
+    io:format("[olm-diag-in] prekey_bytes=~p first_bytes=~s~n",
+              [byte_size(CT), [io_lib:format("~2.16.0B", [B]) || <<B>> <= Prefix]]),
     case matrix_olm_session:create_inbound(State#state.account, SenderKey, CT) of
         {ok, Plain, Session, Acc2} ->
             Pkl    = matrix_olm_session:pickle_session(Session),
@@ -974,42 +1111,28 @@ find_session_by_room_and_id(RoomId, SessionId, Sessions) ->
 do_request_room_key(RoomId, SessionId, SenderKey,
                     #state{token=Token, homeserver=HS, device_id=Did}) ->
     io:format("E2E: requesting room key for ~s / ~s~n", [RoomId, SessionId]),
-    MembersPath = "/_matrix/client/v3/rooms/" ++
-                  uri_string:quote(binary_to_list(RoomId)) ++ "/members",
-    Members = case matrix_http:get(HS, MembersPath, Token) of
-        {ok, Body} ->
-            Data  = json:decode(Body),
-            Chunk = maps:get(<<"chunk">>, Data, []),
-            [maps:get(<<"state_key">>, E, <<>>) || E <- Chunk,
-             maps:get(<<"type">>, E, <<>>) =:= <<"m.room.member">>,
-             maps:get(<<"membership">>,
-                      maps:get(<<"content">>, E, #{}), <<>>) =:= <<"join">>];
-        Err ->
-            io:format("E2E: failed to get room members: ~p~n", [Err]),
-            []
-    end,
-    Messages = lists:foldl(fun(UserId, Acc) ->
-        DevBody = #{<<"device_keys">> => #{UserId => []}},
-        case matrix_http:post(HS, "/_matrix/client/v3/keys/query", Token, DevBody) of
-            {ok, DevResp} ->
-                DevData    = json:decode(DevResp),
-                UserDevMap = maps:get(UserId,
-                                      maps:get(<<"device_keys">>, DevData, #{}), #{}),
-                DevMsgs = maps:from_list([
-                    {DevId, #{<<"action">>               => <<"request">>,
-                              <<"body">>                 => #{
-                                  <<"algorithm">>  => <<"m.megolm.v1.aes-sha2">>,
-                                  <<"room_id">>    => RoomId,
-                                  <<"sender_key">> => SenderKey,
-                                  <<"session_id">> => SessionId},
-                              <<"request_id">>           => gen_request_id(),
-                              <<"requesting_device_id">> => Did}}
-                    || DevId <- maps:keys(UserDevMap), DevId =/= Did
-                ]),
-                maps:put(UserId, DevMsgs, Acc);
-            _ -> Acc
+    Members   = get_room_joined_members(RoomId, Token, HS),
+    DeviceMap = query_device_keys(Members, Token, HS),
+    ReqBody   = #{<<"action">>               => <<"request">>,
+                  <<"body">>                 => #{
+                      <<"algorithm">>  => <<"m.megolm.v1.aes-sha2">>,
+                      <<"room_id">>    => RoomId,
+                      <<"sender_key">> => SenderKey,
+                      <<"session_id">> => SessionId},
+                  <<"request_id">>           => gen_request_id(),
+                  <<"requesting_device_id">> => Did},
+    Messages = maps:fold(fun(UserId, UserDevs, Acc) ->
+        DevMsgs = maps:fold(fun(DevId, _, DA) ->
+            case DevId =:= Did of
+                true  -> DA;
+                false -> maps:put(DevId, ReqBody, DA)
+            end
+        end, #{}, UserDevs),
+        case map_size(DevMsgs) > 0 of
+            true  -> maps:put(UserId, DevMsgs, Acc);
+            false -> Acc
         end
-    end, #{}, Members),
+    end, #{}, DeviceMap),
     case map_size(Messages) > 0 of
         false -> io:format("E2E: no devices found to request key from~n");
         true  ->
@@ -1019,8 +1142,8 @@ do_request_room_key(RoomId, SessionId, SenderKey,
                 {ok, _} ->
                     io:format("E2E: room key request sent to ~p user(s)~n",
                               [map_size(Messages)]);
-                Err1 ->
-                    io:format("E2E: room key request failed: ~p~n", [Err1])
+                Err ->
+                    io:format("E2E: room key request failed: ~p~n", [Err])
             end
     end.
 
@@ -1100,15 +1223,7 @@ sign_json_ed25519(Map, PrivKey) ->
 
 b64u(Bin) ->
     B = base64:encode(Bin),
-    binary:part(B, 0, byte_size(B) - count_padding(B)).
-
-count_padding(B) ->
-    case binary:last(B) of
-        $= -> 1 + count_padding(binary:part(B, 0, byte_size(B)-1));
-        _  -> 0
-    end.
-
-sign_json(Map, Account) -> sign_json_raw(Map, Account).
+    << <<C>> || <<C>> <= B, C =/= $= >>.
 
 pkcs7_unpad(Bin) ->
     PadLen = binary:last(Bin),
